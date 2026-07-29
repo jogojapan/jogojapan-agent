@@ -1,0 +1,23 @@
+{
+  "mcp_servers": [
+    {
+      "name": "fastmail",
+      "url": "https://api.fastmail.com/mcp",
+      "auth": {
+        "type": "bearer",
+        "token": "${FASTMAIL_API_TOKEN}"
+      }
+    }
+  ],
+  "models": {
+    "default": "llama3-8b-8192",
+    "providers": {
+      "groq": {
+        "api_key": "${GROQ_API_KEY}"
+      }
+    }
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
