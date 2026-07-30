@@ -1,6 +1,6 @@
 python-dotenv==1.2.2
-crewai-tools[mcp]
 crewai==1.15.8
-crewai-cli==1.15.8
+crewai-cli>=1.15.8
 crewai-tools==1.15.8
 litellm==1.94.0
+crewai-tools[mcp]

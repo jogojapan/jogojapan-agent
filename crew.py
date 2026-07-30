@@ -4,9 +4,14 @@ Fastmail Crew AI Agent - Corrected MCP Integration
 """
 
 import os
+import uuid
+from typing import cast
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, LLM
 from crewai.mcp import MCPServerHTTP
+from crewai.flow import Flow, listen
+from crewai.experimental import ConversationConfig, RouterConfig, ConversationState
+from crewai.flow.persistence import SQLiteFlowPersistence, persist
 
 # Monkey-patch to fix cache_breakpoint issue with Groq
 import crewai.llms.cache as _crewai_cache
@@ -63,7 +68,8 @@ if not FASTMAIL_API_TOKEN:
 # tool call, which Groq then rejects). llama-3.3-70b-versatile reliably
 # issues proper native tool calls against the Fastmail MCP tools.
 groq_llm = LLM(
-    model="groq/llama-3.3-70b-versatile",
+    # model="groq/llama-3.3-70b-versatile",
+    model="groq/openai/gpt-oss-20b",
     api_key=GROQ_API_KEY,
     temperature=0,
 )
@@ -101,18 +107,85 @@ if not fastmail_expert.tools:
     exit(1)
 print(f"Discovered {len(fastmail_expert.tools)} Fastmail MCP tools.")
 
-def create_fastmail_task(user_query):
-    """Create a task that actually performs Fastmail operations"""
-    task = Task(
-        description=f"""
-        Execute the user's request on their Fastmail account: "{user_query}"
+_DB_PATH = "fastmail_chat_state.db"
+_SESSION_ID_FILE = ".fastmail_session_id"
 
-        Use the available Fastmail MCP tools to perform the actual operations.
-        """,
-        agent=fastmail_expert,
-        expected_output="The actual results from performing the requested operations"
+
+def get_or_create_session_id() -> str:
+    """Reads a persisted session UUID from disk, or creates and saves a fresh one."""
+    if os.path.exists(_SESSION_ID_FILE):
+        with open(_SESSION_ID_FILE) as f:
+            sid = f.read().strip()
+            if sid:
+                return sid
+    sid = str(uuid.uuid4())
+    with open(_SESSION_ID_FILE, "w") as f:
+        f.write(sid)
+    return sid
+
+
+_session_id = get_or_create_session_id()
+_persistence = SQLiteFlowPersistence(db_path=_DB_PATH)
+
+
+@persist(_persistence)
+class FastmailConversation(Flow):
+    # Experimental conversational Flow API — pin crewai==1.15.8 before upgrading
+    conversational = True
+    conversational_config = ConversationConfig(
+        llm=groq_llm,
+        answer_from_history_llm=groq_llm,
+        router=RouterConfig(
+            route_descriptions={
+                "fastmail_action": (
+                    "User wants to perform or check something in their real Fastmail "
+                    "account: search, read, move, or send email; manage calendar "
+                    "events or contacts. Requires calling Fastmail MCP tools."
+                )
+            }
+        ),
     )
-    return task
+
+    @listen("fastmail_action")
+    def run_fastmail_action(self) -> str:
+        state = cast(ConversationState, self.state)
+        user_message = state.current_user_message or ""
+
+        # Build a short prior-turn transcript so the agent has conversational context
+        recent = self.conversation_messages
+        history_lines = [
+            f"{m['role'].capitalize()}: {m.get('content', '')}"
+            for m in recent[:-1]
+        ]
+        context_section = (
+            "\nConversation context:\n" + "\n".join(history_lines[-8:]) + "\n"
+            if history_lines
+            else ""
+        )
+
+        task = Task(
+            description=(
+                f'Execute the user\'s request on their Fastmail account: "{user_message}"'
+                f"{context_section}\n"
+                "Use the available Fastmail MCP tools to perform the actual operations."
+            ),
+            agent=fastmail_expert,
+            expected_output="The actual results from performing the requested operations",
+        )
+        crew = Crew(agents=[fastmail_expert], tasks=[task], verbose=True)
+
+        try:
+            result = crew.kickoff()
+        except Exception as exc:
+            result = f"Error: {exc}"
+
+        result_str = str(result)
+        self.append_agent_result("fastmail_expert", result_str, visibility="public")
+        return result_str
+
+
+conversation = FastmailConversation()
+
 
 def print_welcome():
     """Print welcome message"""
@@ -136,6 +209,8 @@ def show_config():
     print(f"Fastmail MCP URL: {fastmail_mcp_server.url}")
     print(f"Streamable HTTP: {fastmail_mcp_server.streamable}")
     print(f"MCP tools attached to agent: {len(fastmail_expert.tools or [])}")
+    print(f"Session ID: {_session_id}")
+    print(f"State DB: {os.path.abspath(_DB_PATH)}")
 
 def main():
     """Main chat loop"""
@@ -160,15 +235,8 @@ def main():
 
             print("Processing your request... 🤖")
 
-            task = create_fastmail_task(user_input)
-            crew = Crew(
-                agents=[fastmail_expert],
-                tasks=[task],
-                verbose=True
-            )
-
             try:
-                result = crew.kickoff()
+                result = conversation.handle_turn(user_input, session_id=_session_id)
                 print("\n" + "=" * 40)
                 print("Response:")
                 print("=" * 40)
