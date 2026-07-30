@@ -7,6 +7,15 @@
         "type": "bearer",
         "token": "${FASTMAIL_API_TOKEN}"
       }
+    },
+    {
+      "name": "nextcloud",
+      "url": "${NC_MCP}",
+      "auth": {
+        "type": "basic",
+        "username": "${NC_USER}",
+        "password": "${NC_PW}"
+      }
     }
   ],
   "models": {

@@ -5,6 +5,8 @@ Fastmail Crew AI Agent - Corrected MCP Integration
 
 import os
 import uuid
+import base64
+import datetime
 from typing import cast
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, LLM
@@ -74,6 +76,18 @@ groq_llm = LLM(
     temperature=0,
 )
 
+# Separate model for conversation routing and history answering (no tool calls).
+# gpt-oss-20b ignores tool_choice="none" and hallucinates tool calls, which
+# Groq rejects; llama-3.3-70b-versatile reliably produces plain text there.
+groq_routing_llm = LLM(
+    model="groq/llama-3.3-70b-versatile",
+    api_key=GROQ_API_KEY,
+    temperature=0,
+)
+
+# Groq rejects requests with more than 128 tools per call
+_GROQ_TOOL_LIMIT = 128
+
 # Fastmail MCP server configuration (native CrewAI MCP support)
 fastmail_mcp_server = MCPServerHTTP(
     url="https://api.fastmail.com/mcp",
@@ -105,7 +119,56 @@ if not fastmail_expert.tools:
     print("ERROR: No tools discovered from the Fastmail MCP server. "
           "Check FASTMAIL_API_TOKEN and network connectivity.")
     exit(1)
+if len(fastmail_expert.tools) > _GROQ_TOOL_LIMIT:
+    fastmail_expert.tools = fastmail_expert.tools[:_GROQ_TOOL_LIMIT]
 print(f"Discovered {len(fastmail_expert.tools)} Fastmail MCP tools.")
+
+# --- Nextcloud MCP server (HTTP Basic Auth; MCP session ID managed by transport layer) ---
+NC_USER = os.getenv('NC_USER')
+NC_PW = os.getenv('NC_PW')
+NC_MCP = os.getenv('NC_MCP')
+
+_nextcloud_available = False
+nextcloud_expert = None
+
+if NC_USER and NC_PW and NC_MCP:
+    _nc_auth = base64.b64encode(f"{NC_USER}:{NC_PW}".encode()).decode()
+    nextcloud_mcp_server = MCPServerHTTP(
+        url=NC_MCP,
+        headers={"Authorization": f"Basic {_nc_auth}"},
+        streamable=True,
+    )
+    nextcloud_expert = Agent(
+        role='Nextcloud Assistant',
+        goal='Help users interact with their Nextcloud instance using real MCP tools',
+        backstory=(
+            "You are an AI assistant with direct access to the Nextcloud MCP server. "
+            "You can manage notes, files (WebDAV), calendar events and todos, contacts, "
+            "kanban boards (Deck), wiki pages (Collectives), cookbook recipes, "
+            "RSS news feeds, Nextcloud Mail, Nextcloud Talk, and shared Tables."
+        ),
+        llm=groq_llm,
+        verbose=True,
+        allow_delegation=False,
+    )
+    print("Connecting to Nextcloud MCP server and discovering tools...")
+    nextcloud_expert.tools = nextcloud_expert.get_mcp_tools([nextcloud_mcp_server])
+    if nextcloud_expert.tools:
+        # cookbook (13 tools) and news (8 tools) dropped to stay under the 128-tool Groq limit
+        _nc_drop = ("nc_cookbook_", "nc_news_")
+        nextcloud_expert.tools = [
+            t for t in nextcloud_expert.tools
+            if not t.name.startswith(_nc_drop)
+        ]
+        if len(nextcloud_expert.tools) > _GROQ_TOOL_LIMIT:
+            nextcloud_expert.tools = nextcloud_expert.tools[:_GROQ_TOOL_LIMIT]
+        print(f"Discovered {len(nextcloud_expert.tools)} Nextcloud MCP tools.")
+        _nextcloud_available = True
+    else:
+        print("Warning: No tools discovered from Nextcloud MCP server. "
+              "Check NC_USER, NC_PW, NC_MCP and network connectivity.")
+else:
+    print("Warning: NC_USER, NC_PW, or NC_MCP not set — Nextcloud MCP disabled")
 
 _DB_PATH = "fastmail_chat_state.db"
 _SESSION_ID_FILE = ".fastmail_session_id"
@@ -133,15 +196,22 @@ class FastmailConversation(Flow):
     # Experimental conversational Flow API — pin crewai==1.15.8 before upgrading
     conversational = True
     conversational_config = ConversationConfig(
-        llm=groq_llm,
-        answer_from_history_llm=groq_llm,
+        llm=groq_routing_llm,
+        answer_from_history_llm=groq_routing_llm,
         router=RouterConfig(
             route_descriptions={
                 "fastmail_action": (
                     "User wants to perform or check something in their real Fastmail "
                     "account: search, read, move, or send email; manage calendar "
                     "events or contacts. Requires calling Fastmail MCP tools."
-                )
+                ),
+                "nextcloud_action": (
+                    "User wants to interact with their Nextcloud instance: manage notes, "
+                    "files or documents (WebDAV), calendar events or todos, contacts, "
+                    "kanban boards (Deck), wiki pages (Collectives), cookbook recipes, "
+                    "RSS news, Nextcloud Mail, Nextcloud Talk, or shared Tables. "
+                    "Use for anything Nextcloud-specific."
+                ),
             }
         ),
     )
@@ -165,12 +235,18 @@ class FastmailConversation(Flow):
 
         task = Task(
             description=(
+                f'Today is {datetime.date.today().strftime("%A, %B %d, %Y")}. '
                 f'Execute the user\'s request on their Fastmail account: "{user_message}"'
                 f"{context_section}\n"
-                "Use the available Fastmail MCP tools to perform the actual operations."
+                "Use the available Fastmail MCP tools to perform the actual operations. "
+                "Present the results in clear, friendly natural language — never return raw JSON. "
+                "Reply in the same language the user wrote in."
             ),
             agent=fastmail_expert,
-            expected_output="The actual results from performing the requested operations",
+            expected_output=(
+                f'A natural-language answer to the user\'s request "{user_message}". '
+                "Write the answer in the same language as that request."
+            ),
         )
         crew = Crew(agents=[fastmail_expert], tasks=[task], verbose=True)
 
@@ -183,6 +259,54 @@ class FastmailConversation(Flow):
         self.append_agent_result("fastmail_expert", result_str, visibility="public")
         return result_str
 
+    @listen("nextcloud_action")
+    def run_nextcloud_action(self) -> str:
+        if not _nextcloud_available:
+            return (
+                "Nextcloud is not configured. "
+                "Set NC_USER, NC_PW, and NC_MCP in your .env file."
+            )
+
+        state = cast(ConversationState, self.state)
+        user_message = state.current_user_message or ""
+
+        recent = self.conversation_messages
+        history_lines = [
+            f"{m['role'].capitalize()}: {m.get('content', '')}"
+            for m in recent[:-1]
+        ]
+        context_section = (
+            "\nConversation context:\n" + "\n".join(history_lines[-8:]) + "\n"
+            if history_lines
+            else ""
+        )
+
+        task = Task(
+            description=(
+                f'Today is {datetime.date.today().strftime("%A, %B %d, %Y")}. '
+                f'Execute the user\'s request on their Nextcloud instance: "{user_message}"'
+                f"{context_section}\n"
+                "Use the available Nextcloud MCP tools to perform the actual operations. "
+                "Present the results in clear, friendly natural language — never return raw JSON. "
+                "Reply in the same language the user wrote in."
+            ),
+            agent=nextcloud_expert,
+            expected_output=(
+                f'A natural-language answer to the user\'s request "{user_message}". '
+                "Write the answer in the same language as that request."
+            ),
+        )
+        crew = Crew(agents=[nextcloud_expert], tasks=[task], verbose=True)
+
+        try:
+            result = crew.kickoff()
+        except Exception as exc:
+            result = f"Error: {exc}"
+
+        result_str = str(result)
+        self.append_agent_result("nextcloud_expert", result_str, visibility="public")
+        return result_str
+
 
 conversation = FastmailConversation()
 
@@ -190,14 +314,17 @@ conversation = FastmailConversation()
 def print_welcome():
     """Print welcome message"""
     print("=" * 60)
-    print("Fastmail Crew AI Assistant - Real MCP Integration")
+    print("Crew AI Assistant - Fastmail + Nextcloud MCP Integration")
     print("=" * 60)
     print("Commands:")
     print("  quit, exit, q  - Exit the chat")
     print("  help, h        - Show this help message")
     print("  config         - Show current configuration")
     print("-" * 60)
-    print("Enter your queries about your Fastmail account...")
+    print("Fastmail: email, calendar, contacts")
+    nc_status = "enabled" if _nextcloud_available else "disabled (missing credentials)"
+    print(f"Nextcloud ({nc_status}): notes, files, calendar, tasks, contacts,")
+    print("  kanban (Deck), wiki (Collectives), recipes, news, mail, talk")
     print("=" * 60)
 
 def show_config():
@@ -207,19 +334,23 @@ def show_config():
     print(f"Groq API Key: {'SET' if GROQ_API_KEY else 'NOT SET'}")
     print(f"Fastmail API Token: {'SET' if FASTMAIL_API_TOKEN else 'NOT SET'}")
     print(f"Fastmail MCP URL: {fastmail_mcp_server.url}")
-    print(f"Streamable HTTP: {fastmail_mcp_server.streamable}")
-    print(f"MCP tools attached to agent: {len(fastmail_expert.tools or [])}")
+    print(f"Fastmail MCP tools: {len(fastmail_expert.tools or [])}")
+    print(f"NC_USER: {'SET' if NC_USER else 'NOT SET'}")
+    print(f"NC_MCP URL: {NC_MCP or 'NOT SET'}")
+    print(f"Nextcloud available: {_nextcloud_available}")
+    if _nextcloud_available:
+        print(f"Nextcloud MCP tools: {len(nextcloud_expert.tools or [])}")
     print(f"Session ID: {_session_id}")
     print(f"State DB: {os.path.abspath(_DB_PATH)}")
 
 def main():
     """Main chat loop"""
-    print("Fastmail Crew AI Assistant Initializing...")
+    print("Crew AI Assistant Initializing...")
     print_welcome()
 
     while True:
         try:
-            user_input = input("\n📧 Fastmail Crew AI > ").strip()
+            user_input = input("\n🤖 AI Assistant > ").strip()
 
             if user_input.lower() in ['quit', 'exit', 'q']:
                 print("Goodbye! 👋")
