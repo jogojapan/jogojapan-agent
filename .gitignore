@@ -1,5 +1,6 @@
 .env
 .venv
+.nodeenv
 venv
 __pycache__
 .fastmail_session_id

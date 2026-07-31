@@ -1,0 +1,5 @@
+# Local filesystem directories the MCP filesystem server is allowed to read.
+# Environment variables like $HOME are expanded at startup.
+# The agent can browse and read files in these directories but cannot write to them.
+directories:
+  - "$HOME"
